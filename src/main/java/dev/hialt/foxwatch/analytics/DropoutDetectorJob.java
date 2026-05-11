@@ -3,8 +3,10 @@ package dev.hialt.foxwatch.analytics;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
@@ -17,39 +19,32 @@ import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTime
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
-
+import org.apache.flink.configuration.Configuration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-
 public class DropoutDetectorJob {
 
-    private static final Logger log = LogManager.getLogger(DropoutDetectorJob.class);
-    static {
-        // This is your 'Debug Emergency Flare'
-        System.out.println("!!! DROPOUT DETECTOR STARTING UP - SYSTEM.OUT CHECK !!!");
-        log.info("!!! DROPOUT DETECTOR STARTING UP - LOG4J CHECK !!!");
-    }
     static final String KAFKA_BOOTSTRAP =
             "bitbybit-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092";
-    static final String SOURCE_TOPIC = "foxwatch-telemetry";
-    static final String SINK_TOPIC   = "foxwatch-analytics";
+    static final String SOURCE_TOPIC  = "foxwatch-telemetry";
+    static final String SINK_TOPIC    = "foxwatch-analytics";
     static final String CONSUMER_GROUP = "flink-foxwatch-dropout-java";
 
     public static void main(String[] args) throws Exception {
 
+        SeqClient.info("Dropout detector starting up",
+                "source", "java-dropout-detector");
+
         StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.getExecutionEnvironment();
 
-        // ── Source ────────────────────────────────────────────────────────
         KafkaSource<String> source = KafkaSource.<String>builder()
                 .setBootstrapServers(KAFKA_BOOTSTRAP)
                 .setTopics(SOURCE_TOPIC)
                 .setGroupId(CONSUMER_GROUP)
-                .setStartingOffsets(OffsetsInitializer.earliest())
+                .setStartingOffsets(OffsetsInitializer.latest())
                 .setValueOnlyDeserializer(new SimpleStringSchema())
                 .build();
 
@@ -59,18 +54,22 @@ public class DropoutDetectorJob {
                 "foxwatch-telemetry-source"
         );
 
-        // ── Parse and filter Unavailable events ───────────────────────────
         DataStream<Tuple2<String, Integer>> unavailable = raw
-                .map(new ParseAndFilter())
-                .filter(t -> t != null);
+                .keyBy(json -> {
+                    try {
+                        ObjectNode node = (ObjectNode) new ObjectMapper().readTree(json);
+                        return node.path("device_id").asText("unknown-device");
+                    } catch (Exception e) {
+                        return "unknown-device";
+                    }
+                })
+                .flatMap(new ParseAndFilter());
 
-        // ── Key by device_id, tumbling 5-minute processing time window ────
         DataStream<String> summaries = unavailable
                 .keyBy(t -> t.f0)
                 .window(TumblingProcessingTimeWindows.of(Time.minutes(5)))
                 .process(new DropoutWindowFunction());
 
-        // ── Sink ──────────────────────────────────────────────────────────
         KafkaSink<String> sink = KafkaSink.<String>builder()
                 .setBootstrapServers(KAFKA_BOOTSTRAP)
                 .setRecordSerializer(
@@ -86,39 +85,74 @@ public class DropoutDetectorJob {
         env.execute("foxwatch-dropout-detector");
     }
 
-    // ── Parse JSON and extract device_id if state == Unavailable ─────────
-    static class ParseAndFilter implements MapFunction<String, Tuple2<String, Integer>> {
+    // ── Parse and filter Unavailable events ──────────────────────────────
+    // Keyed state remembers last known non-Unavailable state per device.
+    static class ParseAndFilter extends RichFlatMapFunction<String, Tuple2<String, Integer>> {
         private final ObjectMapper mapper = new ObjectMapper();
-
+        private transient ValueState<String> lastKnownNonUnavailableState;
 
         @Override
-        public Tuple2<String, Integer> map(String json) {
+        public void open(Configuration parameters) {
+            ValueStateDescriptor<String> desc =
+                    new ValueStateDescriptor<>("lastKnownNonUnavailableState", String.class);
+            lastKnownNonUnavailableState = getRuntimeContext().getState(desc);
+        }
+
+        @Override
+        public void flatMap(String json, Collector<Tuple2<String, Integer>> out) {
             try {
-                // Log a tiny bit more for debugging
                 ObjectNode node = (ObjectNode) mapper.readTree(json);
 
-                // Check if 'state' actually exists before asText()
-                if (!node.has("state")) {
-                    log.debug("Skipping message: no state field found");
-                    return null;
+                if (!node.has("state") || node.get("state").isNull()) {
+                    return;
                 }
 
-                String state = node.path("state").asText("");
+                String state    = node.path("state").asText("");
                 String deviceId = node.path("device_id").asText("unknown-device");
 
-                if ("Unavailable".equalsIgnoreCase(state)) {
-                    log.info("!!! DROPOUT DETECTED !!! Device: {}", deviceId);
-                    return Tuple2.of(deviceId, 1);
+                // Prefer explicit availability (new foxwatch envelope field),
+                // fall back to legacy interpretation via `state`.
+                boolean unavailable =
+                        (node.has("is_available") && !node.get("is_available").isNull())
+                                ? !node.path("is_available").asBoolean(true)
+                                : "Unavailable".equalsIgnoreCase(state);
+
+                if (!unavailable) {
+                    // Update state on every On/Off event.
+                    if ("On".equalsIgnoreCase(state) || "Off".equalsIgnoreCase(state)) {
+                        lastKnownNonUnavailableState.update(
+                                "On".equalsIgnoreCase(state) ? "On" : "Off"
+                        );
+                    }
+                    return;
+                }
+
+                // Unavailable received: only count if preceded by a known "On".
+                String last = lastKnownNonUnavailableState.value();
+                if ("On".equalsIgnoreCase(last)) {
+                    SeqClient.info("Unavailable event received",
+                            "device_id", deviceId,
+                            "source", "java-dropout-detector");
+                    out.collect(Tuple2.of(deviceId, 1));
+                    return;
+                }
+
+                if ("Off".equalsIgnoreCase(last)) {
+                    SeqClient.info("Unavailable suppressed",
+                            "device_id", deviceId,
+                            "suppressed_reason", "preceded_by_off",
+                            "source", "java-dropout-detector");
+                    return;
                 }
             } catch (Exception e) {
-                // This will show up in the Flink TaskManager 'Stdout/Stderr' logs
-                log.error("JSON Parse Failure: {} | Raw: {}", e.getMessage(), json);
+                SeqClient.info("JSON parse failure",
+                        "error", e.getMessage(),
+                        "source", "java-dropout-detector");
             }
-            return null;
         }
     }
 
-    // ── Emit a JSON summary when each window closes ───────────────────────
+    // ── Emit summary when window closes ──────────────────────────────────
     static class DropoutWindowFunction
             extends ProcessWindowFunction<Tuple2<String, Integer>, String, String, TimeWindow> {
 
@@ -137,16 +171,20 @@ public class DropoutDetectorJob {
             int count = 0;
             for (Tuple2<String, Integer> e : elements) count += e.f1;
 
-            log.info("Window closed device_id={} dropout_count={} window_start={}",
-                    deviceId, count,
-                    FMT.format(Instant.ofEpochMilli(context.window().getStart())));
+            String windowStart = FMT.format(
+                    Instant.ofEpochMilli(context.window().getStart()));
+
+            SeqClient.info("Window closed",
+                    "device_id",     deviceId,
+                    "dropout_count", String.valueOf(count),
+                    "window_start",  windowStart,
+                    "source",        "java-dropout-detector");
 
             ObjectNode result = mapper.createObjectNode();
             result.put("device_id",     deviceId);
             result.put("dropout_count", count);
-            result.put("window_start",
-                    FMT.format(Instant.ofEpochMilli(context.window().getStart())));
-            result.put("source", "java-dropout-detector");
+            result.put("window_start",  windowStart);
+            result.put("source",        "java-dropout-detector");
 
             out.collect(mapper.writeValueAsString(result));
         }
