@@ -1,13 +1,14 @@
 #!/bin/bash
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+# 1. Build
+./gradlew clean shadowJar
 
-# 1. Build the fresh Fat Jar
-./gradlew shadowJar
-
-# 2. Build the Docker image (this is the "Copy" step now)
+# 2. Containerize
 docker build -t hialtdev/foxwatch-analytics:latest .
 
-# 3. Push to your local K3s image store (since Docker Hub is giving you grief)
+# 3. Clean K3s cache (The "Fix")
+sudo k3s ctr images rm docker.io/hialtdev/foxwatch-analytics:latest
 docker save hialtdev/foxwatch-analytics:latest | sudo k3s ctr images import -
 
-# 4. Force Kubernetes to restart the pods with the new image
-kubectl rollout restart deployment/foxwatch-dropout-detector -n flink
+# 4. Apply Infrastructure
+kubectl apply -f k8s/flink-application.yaml

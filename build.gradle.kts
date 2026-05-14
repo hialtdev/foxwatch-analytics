@@ -31,14 +31,8 @@ dependencies {
     // Jackson for JSON parsing
     implementation("com.fasterxml.jackson.core:jackson-databind:2.17.0")
 
-    // Logging — Log4j2 (Flink provides log4j-api, we need the impl and HTTP appender)
-    implementation("org.apache.logging.log4j:log4j-core:2.23.1")
-    implementation("org.apache.logging.log4j:log4j-api:2.23.1")
-    implementation("org.apache.logging.log4j:log4j-slf4j2-impl:2.23.1")
 
-// HTTP appender for Seq — sends CLEF events over HTTP
-    implementation("com.lmax:disruptor:3.4.4")
-    implementation("org.apache.httpcomponents:httpclient:4.5.14")
+
 
     // Testing
     testImplementation(platform("org.junit:junit-bom:5.10.0"))
