@@ -1,0 +1,26 @@
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: foxwatch-dropout-detector
+  namespace: flink
+spec:
+  serviceAccount: flink
+  image: hialtdev/foxwatch-analytics:latest
+  imagePullPolicy: Never
+  flinkVersion: v1_19
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "2"
+    taskmanager.memory.managed.fraction: "0.1"
+  jobManager:
+    resource:
+      memory: "1536m"
+      cpu: 0.5
+  taskManager:
+    resource:
+      memory: "1024m"
+      cpu: 0.5
+  job:
+    jarURI: local:///opt/flink/usrlib/foxwatch-analytics.jar
+    entryClass: dev.hialt.foxwatch.analytics.DropoutDetectorJob
+    parallelism: 1
+    upgradeMode: stateless
