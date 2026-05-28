@@ -39,6 +39,7 @@ public class DropoutDetectorJob {
 
         StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.getExecutionEnvironment();
+        env.disableOperatorChaining();
 
         KafkaSource<String> source = KafkaSource.<String>builder()
                 .setBootstrapServers(KAFKA_BOOTSTRAP)
@@ -168,6 +169,9 @@ public class DropoutDetectorJob {
                 Iterable<Tuple2<String, Integer>> elements,
                 Collector<String> out
         ) throws Exception {
+            SeqClient.info("Window process called",
+                    "device_id", deviceId,
+                    "source", "java-dropout-detector");
             int count = 0;
             for (Tuple2<String, Integer> e : elements) count += e.f1;
 
